@@ -1,0 +1,312 @@
+# labwc-blur: keep the ext-background-effect patch stack rebased on the
+# latest upstream labwc tag and publish an Arch Linux package for it.
+#
+# Flow:
+#   sync     - detect the newest upstream labwc tag (or an explicit input),
+#              rebase origin/ext-background-effect onto it (git rerere cache
+#              makes recurring conflicts automatic), swap scenefx includes
+#              in files added upstream, push the branch and create the
+#              labwc-blur-<tag> release tag.
+#   package  - build pkg/arch/PKGBUILD inside an archlinux container.
+#   release  - attach the .pkg.tar.zst to the labwc-blur-<tag> GitHub release.
+#   notify   - open (deduplicated) issue if anything failed.
+#
+# The workflow must live on the default branch for schedule/repository_dispatch
+# to work.  Failure details land in the run's step summary, linked from the
+# issue body.
+
+name: labwc-blur
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  # Optional: a watcher (e.g. release-monitoring.org) can POST a
+  # repository_dispatch event to sync immediately.
+  repository_dispatch:
+    types: [upstream-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream labwc tag to sync to (empty = latest release)'
+        required: false
+        default: ''
+      pkgrel:
+        description: 'pkgrel of the Arch package (bump to republish a version)'
+        required: false
+        default: '1'
+
+concurrency:
+  group: labwc-blur
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  BRANCH: ext-background-effect
+  MASTER: master
+
+jobs:
+  sync:
+    name: Rebase patch stack on upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.target.outputs.tag }}
+      release_missing: ${{ steps.target.outputs.release_missing }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore rerere cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/rr-cache
+          key: rr-cache-${{ github.run_id }}
+          restore-keys: rr-cache-
+
+      - name: Determine target upstream tag
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag || '' }}
+        run: |
+          set -eu
+          git fetch origin --prune --force \
+            '+refs/heads/*:refs/remotes/origin/*'
+          git remote add upstream https://github.com/labwc/labwc.git 2>/dev/null || true
+          git fetch upstream --tags --force --quiet
+
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(git ls-remote --tags --refs upstream \
+              | sed -n 's|.*refs/tags/||p' \
+              | grep -E '^[0-9]+(\.[0-9]+)+$' \
+              | sort -V | tail -1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::cannot determine the latest upstream labwc tag"
+            exit 1
+          fi
+
+          release_missing=true
+          if gh release view "labwc-blur-$tag" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_missing=false
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_missing=$release_missing" >> "$GITHUB_OUTPUT"
+          echo "Target upstream tag: $tag (release missing: $release_missing)"
+
+      - name: Rebase patch stack onto the tag
+        id: rebase
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -eu
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git config rerere.enabled true
+
+          # rehydrate the rerere cache saved by actions/cache
+          mkdir -p .git/rr-cache
+          cp -a /tmp/rr-cache/. .git/rr-cache/ 2>/dev/null || true
+
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+          base=$(git merge-base "$BRANCH" "origin/$MASTER")
+
+          if ! git rebase --onto "$TAG" "$base" "$BRANCH"; then
+            conflicts=$(git diff --name-only --diff-filter=U || true)
+            git rebase --abort || true
+            {
+              echo "## labwc-blur rebase conflict"
+              echo "Rebase of \`$BRANCH\` (base \`$base\`) onto upstream"
+              echo "**$TAG** stopped on:"
+              echo
+              echo '```text'
+              echo "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if git diff --quiet "$TAG" HEAD; then
+            echo "::error::patch stack vanished after rebasing onto $TAG" \
+              "(upstream may have absorbed the feature); see step summary"
+            {
+              echo "## labwc-blur patch stack vanished"
+              echo "After rebasing onto **$TAG** the branch is identical to" \
+                "the tag - upstream absorbed the changes or every patch" \
+                "became empty.  Drop or rework the stack."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Swap scenefx includes in files added upstream
+        id: swap
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -eu
+          if [ -f scripts/swap-scenefx-includes.sh ]; then
+            sh scripts/swap-scenefx-includes.sh
+          else
+            echo "::warning::scripts/swap-scenefx-includes.sh not on $BRANCH"
+          fi
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m "scenefx: swap wlr_scene.h includes added upstream after $TAG"
+          fi
+
+      - name: Save rerere cache
+        if: always()
+        run: |
+          rm -rf /tmp/rr-cache
+          cp -a .git/rr-cache /tmp/rr-cache 2>/dev/null || true
+
+      - name: Push branch and tag
+        if: always() && steps.rebase.outcome == 'success' && steps.swap.outcome == 'success'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -eu
+          git push --force-with-lease origin "HEAD:refs/heads/$BRANCH"
+          if ! git rev-parse -q --verify "refs/tags/labwc-blur-$TAG" >/dev/null; then
+            git tag "labwc-blur-$TAG"
+            git push origin "refs/tags/labwc-blur-$TAG"
+          fi
+
+  package:
+    name: Build Arch package
+    needs: sync
+    if: >-
+      needs.sync.result == 'success'
+      && needs.sync.outputs.tag != ''
+      && (needs.sync.outputs.release_missing == 'true'
+          || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install base tools
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm git curl sudo
+
+      - uses: actions/checkout@v4
+        with:
+          ref: labwc-blur-${{ needs.sync.outputs.tag }}
+
+      - name: Build package
+        env:
+          TAG: ${{ needs.sync.outputs.tag }}
+          PKGREL: ${{ github.event.inputs.pkgrel || '1' }}
+        run: |
+          set -eu
+          pkgver="$TAG"
+          cd pkg/arch
+          sed -i "s/^pkgver=.*/pkgver=$pkgver/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=$PKGREL/" PKGBUILD
+
+          # Pre-seed the source tarball so makepkg does not download it,
+          # and pin PKGBUILD to its real checksum.
+          tarball="labwc-blur-$pkgver.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/labwc-blur-$pkgver.tar.gz"
+          sha=$(sha256sum "$tarball" | awk '{print $1}')
+          sed -i "s/^sha256sums=.*/sha256sums=('$sha')/" PKGBUILD
+
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/builder
+          chown -R builder:builder .
+          # makepkg installs missing depends/makedepends itself (-s)
+          sudo -u builder env HOME=/home/builder \
+            makepkg -s --noconfirm
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp ./*.pkg.tar.zst "$GITHUB_WORKSPACE/dist/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: labwc-blur-${{ needs.sync.outputs.tag }}
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [sync, package]
+    if: >-
+      needs.sync.result == 'success'
+      && needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: labwc-blur-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          PKGREL: ${{ github.event.inputs.pkgrel || '1' }}
+        run: |
+          set -eu
+          tag="labwc-blur-$TAG"
+          notes=$(cat <<EOF
+          labwc $TAG plus the ext-background-effect-v1 (blur) patch stack.
+
+          Install:
+
+          \`\`\`sh
+          pacman -U labwc-blur-$TAG-$PKGREL-x86_64.pkg.tar.zst
+          \`\`\`
+
+          \`labwc-blur\` provides and conflicts with \`labwc\`.
+          EOF
+          )
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "labwc-blur $TAG" --notes "$notes"
+          fi
+          # drop stale assets (e.g. previous pkgrel) before uploading
+          for a in $(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets -q '.assets[].name'); do
+            gh release delete-asset "$tag" "$a" \
+              --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+          gh release upload "$tag" dist/*.pkg.tar.zst \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  notify:
+    name: Open issue on failure
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create (deduplicated) issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          title='labwc-blur: sync workflow failing'
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --limit 100 --json title -q '.[].title' || true)
+          if printf '%s\n' "$existing" | grep -Fxq "$title"; then
+            echo "open issue already present, not creating another one"
+            exit 0
+          fi
+          body=$(cat <<EOF
+          The labwc-blur sync/packaging workflow failed.
+
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Conflicts (if any) are listed in the run's step summary.  After pushing
+          a fix to \`$BRANCH\`, re-run the workflow from the Actions tab.
+          EOF
+          )
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$title" --body "$body"
